@@ -1,0 +1,47 @@
+{
+  "name": "Terabox Video Downloader Telegram Bot",
+  "description": "High-Speed Telegram bot to download and stream Terabox videos directly up to 2GB on Telegram.",
+  "keywords": ["telegram", "bot", "terabox", "downloader", "video", "pyrogram", "python"],
+  "repository": "https://github.com/yfree1232-afk/terabox-telegram-downloader-bot",
+  "website": "https://telegram.org",
+  "success_url": "/",
+  "stack": "heroku-22",
+  "env": {
+    "BOT_TOKEN": {
+      "description": "Your Telegram Bot Token from @BotFather",
+      "required": true
+    },
+    "API_ID": {
+      "description": "Your Telegram API ID from https://my.telegram.org",
+      "required": true
+    },
+    "API_HASH": {
+      "description": "Your Telegram API HASH from https://my.telegram.org",
+      "required": true
+    },
+    "TERABOX_COOKIE": {
+      "description": "Optional: Terabox ndus session cookie for high-speed authenticated downloads",
+      "required": false,
+      "value": ""
+    },
+    "ADMIN_ID": {
+      "description": "Optional: Telegram User ID of the bot owner",
+      "required": false,
+      "value": ""
+    }
+  },
+  "buildpacks": [
+    {
+      "url": "heroku/python"
+    },
+    {
+      "url": "https://github.com/jonathanong/heroku-buildpack-ffmpeg-latest.git"
+    }
+  ],
+  "formation": {
+    "worker": {
+      "quantity": 1,
+      "size": "eco"
+    }
+  }
+}
