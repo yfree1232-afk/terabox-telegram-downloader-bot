@@ -25,12 +25,6 @@ logging.basicConfig(
 )
 logger = logging.getLogger("TeraboxBot")
 
-# Validate required environment variables
-if not config.BOT_TOKEN or not config.API_ID or not config.API_HASH:
-    logger.error("BOT_TOKEN, API_ID, and API_HASH must be configured in environment variables or config.py!")
-    print("\n[ERROR] Missing Credentials! Please set BOT_TOKEN, API_ID, and API_HASH in .env or Heroku Config Vars.\n")
-    # We do not sys.exit() immediately here so that imports for testing work, but bot start will check it.
-
 app = Client(
     "terabox_downloader_bot",
     api_id=config.API_ID if config.API_ID else 12345,
@@ -47,9 +41,9 @@ async def start_command(client: Client, message: Message):
     user_name = message.from_user.first_name if message.from_user else "User"
     welcome_text = (
         f"👋 **Namaste {user_name}! Welcome to Terabox Video Downloader Bot** 🚀\n\n"
-        f"Mujhe koi bhi **Terabox Video Link** bhejiye, main seedhe video file download karke Telegram par bhej dunga! 🎬\n\n"
+        f"Mujhe koi bhi **Terabox Video Link** bhejiye, main seedhe HD video file download karke Telegram par bhej dunga! 🎬\n\n"
         f"✨ **Features:**\n"
-        f"• ⚡ Fast High-Speed Video Streaming\n"
+        f"• ⚡ High-Speed Video Stream Downloading\n"
         f"• 📊 Real-time Download & Upload Progress Bar\n"
         f"• 📁 2 GB tak ki Large Files Support\n"
         f"• 🎬 Direct Streamable Video with Thumbnail\n\n"
@@ -67,12 +61,11 @@ async def start_command(client: Client, message: Message):
 async def help_command(client: Client, message: Message):
     help_text = (
         "📖 **Terabox Downloader Bot - Help Guide**\n\n"
-        "1️⃣ **Step 1:** Terabox app ya website se video link copy karein.\n"
-        "2️⃣ **Step 2:** Link ko is bot ko chat me paste karke send karein.\n"
-        "3️⃣ **Step 3:** Bot link ko analyze karke download & upload karega.\n\n"
-        "🌐 **Supported Domains:**\n"
-        "`terabox.com`, `teraboxapp.com`, `1024tera.com`, `terasharelink.com`, `nephobox.com`, `4funbox.com`, `mirrobox.com`, `freeterabox.com`\n\n"
-        "⚠️ *Maximum File Limit: 2 GB*"
+        "1️⃣ **Step 1:** Terabox link copy karein.\n"
+        "2️⃣ **Step 2:** Is bot ko link send karein.\n"
+        "3️⃣ **Step 3:** Bot direct playable video file send karega.\n\n"
+        "🌐 **Supported Links:**\n"
+        "`terabox.com`, `teraboxapp.com`, `1024tera.com`, `terafileshare.com`, `freeterabox.com`, etc."
     )
     await message.reply_text(help_text, disable_web_page_preview=True)
 
@@ -104,8 +97,7 @@ async def callback_handler(client: Client, query):
             "📖 **Terabox Downloader Bot - Help Guide**\n\n"
             "1️⃣ Terabox video ka link copy karein.\n"
             "2️⃣ Is bot ko link send karein.\n"
-            "3️⃣ Bot high speed me direct video file bhej dega.\n\n"
-            "Supported links: `terabox.com`, `1024tera.com`, `freeterabox.com` etc."
+            "3️⃣ Bot high speed me direct video file bhej dega."
         )
         await query.message.edit_text(
             help_text,
@@ -135,32 +127,30 @@ async def process_terabox_link(client: Client, message: Message):
     terabox_url = extract_terabox_url(text)
 
     if not terabox_url:
-        # Ignore messages that aren't terabox links (or gently inform if private chat)
         if message.chat.type.name == "PRIVATE":
             await message.reply_text(
-                "❌ **Invalid Terabox Link!**\n\nKripya valid Terabox video link bhejiye (e.g. `https://teraboxapp.com/s/...`).",
+                "❌ **Invalid Terabox Link!**\n\nKripya valid Terabox link bhejiye.",
                 quote=True
             )
         return
 
-    status_msg = await message.reply_text("🔎 **Analyzing Terabox Link...**\n*Extracting direct download stream...*", quote=True)
+    status_msg = await message.reply_text("🔎 **Analyzing Terabox Stream...**\n*Connecting to cloud servers...*", quote=True)
     downloaded_files = []
 
     try:
-        # 1. Extract download info from Terabox link
+        # 1. Resolve video stream metadata
         files = await TeraboxExtractor.get_download_info(terabox_url)
 
         if not files:
-            await status_msg.edit_text("❌ **Error:** No downloadable files found in this link.")
+            await status_msg.edit_text("❌ **Error:** No downloadable video found in this link.")
             return
 
         total_files = len(files)
         for index, file_info in enumerate(files, start=1):
             file_name = file_info.file_name
             file_size = file_info.size
-            dlink = file_info.download_url
+            segments = file_info.segment_urls
 
-            # Check file size limit
             if file_size > config.MAX_FILE_SIZE:
                 await status_msg.edit_text(
                     f"⚠️ **File Too Large!**\n\n"
@@ -171,9 +161,9 @@ async def process_terabox_link(client: Client, message: Message):
                 continue
 
             prefix = f"[{index}/{total_files}] " if total_files > 1 else ""
-            await status_msg.edit_text(f"🚀 {prefix}**Connecting to Terabox server...**\n📁 `{file_name}` (`{human_readable_size(file_size)}`)")
+            await status_msg.edit_text(f"🚀 {prefix}**Downloading video stream...**\n📁 `{file_name}`\n📦 Segments: `{len(segments)}`")
 
-            # Progress callback for downloader
+            # Live download progress callback
             async def progress_update(prog_text: str):
                 try:
                     await status_msg.edit_text(f"{prefix}{prog_text}")
@@ -182,16 +172,16 @@ async def process_terabox_link(client: Client, message: Message):
                 except Exception:
                     pass
 
-            # 2. Download file chunk-by-chunk to disk
-            file_path = await Downloader.download_file(
-                download_url=dlink,
+            # 2. Download and remux stream segments to MP4
+            file_path = await Downloader.download_segments(
+                segment_urls=segments,
                 filename=file_name,
                 total_size=file_size,
                 progress_callback=progress_update
             )
             downloaded_files.append(file_path)
 
-            # 3. Upload video to user
+            # 3. Upload video to user with live progress
             await status_msg.edit_text(f"📤 {prefix}**Uploading video to Telegram...**\n📁 `{file_name}`")
             caption = (
                 f"🎬 **{file_name}**\n\n"
@@ -208,27 +198,21 @@ async def process_terabox_link(client: Client, message: Message):
                 reply_to_message_id=message.id
             )
 
-            # Clean downloaded file immediately after upload to save Heroku disk space
+            # Clean downloaded file
             clean_temp_files(file_path)
             downloaded_files.remove(file_path)
 
-        # Final cleanup confirmation
         await status_msg.delete()
 
     except Exception as e:
         logger.exception(f"Processing failed for URL {terabox_url}: {e}")
         error_msg = str(e)
-        if "Could not extract" in error_msg:
-            err_text = "❌ **Failed to resolve Terabox link!**\nLink might be expired, private, or temporarily unreachable."
-        else:
-            err_text = f"❌ **Error while processing:** `{error_msg}`"
         try:
-            await status_msg.edit_text(err_text)
+            await status_msg.edit_text(f"❌ **Error:** `{error_msg}`")
         except Exception:
             pass
 
     finally:
-        # Guarantee all residual files are purged
         if downloaded_files:
             clean_temp_files(*downloaded_files)
 
