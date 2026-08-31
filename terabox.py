@@ -1,13 +1,15 @@
 import re
 import logging
+import asyncio
 import aiohttp
 import urllib.parse
 from typing import Optional, Dict, Any, List
+import requests
 from config import TERABOX_COOKIE
 
 logger = logging.getLogger(__name__)
 
-USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36"
+USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/135.0.0.0 Safari/537.36 Edg/135.0.0.0"
 
 class TeraboxFile:
     def __init__(self, file_name: str, download_url: str, size: int, thumb_url: Optional[str] = None, fs_id: Optional[str] = None):
@@ -24,221 +26,169 @@ class TeraboxExtractor:
     """Multi-Engine Terabox Link Resolver & Direct Download Link Extractor."""
 
     @staticmethod
-    def extract_surl(url: str) -> Optional[str]:
-        """Extracts the surl key from any Terabox link format."""
-        if not url:
+    def _find_between(s: str, start: str, end: str) -> str:
+        start_index = s.find(start)
+        if start_index == -1:
+            return ""
+        start_index += len(start)
+        end_index = s.find(end, start_index)
+        if end_index == -1:
+            return ""
+        return s[start_index:end_index]
+
+    @classmethod
+    def extract_with_cookie(cls, url: str, cookie: str) -> Optional[List[TeraboxFile]]:
+        """Extracts direct download link using Terabox session cookie (ndus)."""
+        if not cookie:
             return None
         
-        # Format: ?surl=... or &surl=...
-        parsed = urllib.parse.urlparse(url)
-        qs = urllib.parse.parse_qs(parsed.query)
-        if "surl" in qs and qs["surl"]:
-            surl = qs["surl"][0]
-            return surl if surl.startswith("1") else "1" + surl
-        
-        # Format: /s/1... or /s/...
-        match_path = re.search(r"/s/([a-zA-Z0-9_\-]+)", url)
-        if match_path:
-            surl = match_path.group(1)
-            return surl if surl.startswith("1") else "1" + surl
-        
-        # Search anywhere in path for surl
-        match_general = re.search(r"surl=([a-zA-Z0-9_\-]+)", url)
-        if match_general:
-            surl = match_general.group(1)
-            return surl if surl.startswith("1") else "1" + surl
-
-        return None
-
-    @classmethod
-    async def resolve_url_redirect(cls, session: aiohttp.ClientSession, url: str) -> str:
-        """Resolves redirects to get the full final target URL."""
-        headers = {"User-Agent": USER_AGENT}
-        try:
-            async with session.get(url, headers=headers, allow_redirects=True, timeout=aiohttp.ClientTimeout(total=10)) as resp:
-                return str(resp.url)
-        except Exception:
-            return url
-
-    @classmethod
-    async def extract_via_official_api(cls, session: aiohttp.ClientSession, surl: str) -> Optional[List[TeraboxFile]]:
-        """Extracts direct download links using Terabox web APIs."""
-        clean_surl = surl.lstrip("1")
-        domains = ["www.terabox.app", "www.1024tera.com", "www.terabox.com"]
-
-        for domain in domains:
-            api_url = f"https://{domain}/share/list?app_id=250528&shorturl={clean_surl}&root=1"
-            headers = {
-                "User-Agent": USER_AGENT,
-                "Referer": f"https://{domain}/sharing/link?surl={clean_surl}",
-                "Accept": "application/json, text/plain, */*",
-            }
-            if TERABOX_COOKIE:
-                headers["Cookie"] = f"ndus={TERABOX_COOKIE}"
-
-            try:
-                async with session.get(api_url, headers=headers, timeout=aiohttp.ClientTimeout(total=10)) as resp:
-                    if resp.status == 200:
-                        data = await resp.json()
-                        if data.get("errno") == 0 and "list" in data:
-                            files = []
-                            for item in data["list"]:
-                                dlink = item.get("dlink")
-                                if dlink:
-                                    thumb = item.get("thumbs", {}).get("url3") or item.get("thumbs", {}).get("url2") or item.get("thumbs", {}).get("url1")
-                                    files.append(TeraboxFile(
-                                        file_name=item.get("server_filename", "video.mp4"),
-                                        download_url=dlink,
-                                        size=int(item.get("size", 0)),
-                                        thumb_url=thumb,
-                                        fs_id=str(item.get("fs_id", ""))
-                                    ))
-                            if files:
-                                return files
-            except Exception as e:
-                logger.debug(f"Official API ({domain}) error: {e}")
-                continue
-        return None
-
-    @classmethod
-    async def extract_via_fast_proxies(cls, session: aiohttp.ClientSession, original_url: str) -> Optional[List[TeraboxFile]]:
-        """Fallback fast public API resolvers for Terabox."""
-        encoded_url = urllib.parse.quote(original_url, safe="")
-        
-        resolvers = [
-            {
-                "url": "https://terabox-dl.qtcloud.workers.dev/api/get-info",
-                "method": "POST",
-                "json": {"url": original_url}
-            },
-            {
-                "url": "https://terabox.hnn.workers.dev/api/get-info",
-                "method": "POST",
-                "json": {"url": original_url}
-            },
-            {
-                "url": f"https://yt-api-terabox.vercel.app/api?url={encoded_url}",
-                "method": "GET"
-            },
-            {
-                "url": f"https://teradl-api.dapuntaratya.com/generate_file?url={encoded_url}",
-                "method": "GET"
-            },
-            {
-                "url": f"https://terabox.astad.co/api/terabox?url={encoded_url}",
-                "method": "GET"
-            }
-        ]
-
+        cookie_val = cookie if "ndus=" in cookie else f"ndus={cookie}"
         headers = {
+            "Accept": "application/json, text/plain, */*",
+            "Accept-Language": "en-US,en;q=0.9",
+            "Connection": "keep-alive",
+            "Host": "www.terabox.app",
             "User-Agent": USER_AGENT,
-            "Accept": "application/json",
+            "Cookie": cookie_val,
         }
 
-        for resolver in resolvers:
-            try:
-                if resolver.get("method") == "POST":
-                    async with session.post(resolver["url"], json=resolver.get("json"), headers=headers, timeout=aiohttp.ClientTimeout(total=12)) as resp:
-                        if resp.status == 200:
-                            data = await resp.json()
-                            parsed = cls._parse_resolver_data(data)
-                            if parsed:
-                                return parsed
-                else:
-                    async with session.get(resolver["url"], headers=headers, timeout=aiohttp.ClientTimeout(total=12)) as resp:
-                        if resp.status == 200:
-                            data = await resp.json()
-                            parsed = cls._parse_resolver_data(data)
-                            if parsed:
-                                return parsed
-            except Exception as e:
-                logger.debug(f"Resolver {resolver['url']} notice: {e}")
-                continue
+        try:
+            # First request to get canonical URL
+            temp_req = requests.get(url, headers=headers, timeout=20, allow_redirects=True)
+            if not temp_req.ok:
+                return None
+
+            parsed_url = urllib.parse.urlparse(temp_req.url)
+            query_params = urllib.parse.parse_qs(parsed_url.query)
+            
+            surl = None
+            if "surl" in query_params:
+                surl = query_params["surl"][0]
+            else:
+                m = re.search(r"/s/([a-zA-Z0-9_\-]+)", temp_req.url)
+                if m:
+                    surl = m.group(1).lstrip("1")
+
+            if not surl:
+                return None
+
+            # Second request to scrape jsToken, dp-logid, bdstoken
+            req2 = requests.get(temp_req.url, headers=headers, timeout=20)
+            respo = req2.text
+
+            js_token = cls._find_between(respo, 'fn%28%22', '%22%29')
+            if not js_token:
+                m_js = re.search(r'\"jsToken\":\"([a-fA-F0-9]+)\"', respo)
+                if m_js:
+                    js_token = m_js.group(1)
+
+            logid = cls._find_between(respo, 'dp-logid=', '&') or "9097091044853808108"
+            
+            clean_surl = surl.lstrip("1")
+            params = {
+                "app_id": "250528",
+                "web": "1",
+                "channel": "dubox",
+                "clienttype": "0",
+                "jsToken": js_token,
+                "dp-logid": logid,
+                "page": "1",
+                "num": "20",
+                "by": "name",
+                "order": "asc",
+                "site_referer": temp_req.url,
+                "shorturl": clean_surl,
+                "root": "1,",
+            }
+
+            list_resp = requests.get("https://www.terabox.app/share/list", headers=headers, params=params, timeout=20)
+            data = list_resp.json()
+
+            if data and data.get("errno") == 0 and "list" in data and len(data["list"]) > 0:
+                files = []
+                for item in data["list"]:
+                    dlink = item.get("dlink")
+                    if dlink:
+                        thumb = item.get("thumbs", {}).get("url3") or item.get("thumbs", {}).get("url2") or item.get("thumbs", {}).get("url1")
+                        files.append(TeraboxFile(
+                            file_name=item.get("server_filename", "video.mp4"),
+                            download_url=dlink,
+                            size=int(item.get("size", 0)),
+                            thumb_url=thumb,
+                            fs_id=str(item.get("fs_id", ""))
+                        ))
+                if files:
+                    return files
+        except Exception as e:
+            logger.debug(f"Cookie extraction failed: {e}")
+            return None
 
         return None
 
-    @staticmethod
-    def _parse_resolver_data(data: Any) -> Optional[List[TeraboxFile]]:
-        """Parses various JSON response schemas from fallback APIs."""
-        if not data:
-            return None
+    @classmethod
+    async def extract_via_public_apis(cls, session: aiohttp.ClientSession, url: str) -> Optional[List[TeraboxFile]]:
+        """Tries various public mirror APIs."""
+        clean_url = url.strip()
+        encoded = urllib.parse.quote(clean_url, safe="")
+        
+        endpoints = [
+            f"https://terabox-dl.qtcloud.workers.dev/api/get-info",
+            f"https://terabox.hnn.workers.dev/api/get-info",
+            f"https://teradl-api.dapuntaratya.com/generate_file?url={encoded}",
+            f"https://yt-api-terabox.vercel.app/api?url={encoded}"
+        ]
 
-        # If data is a list
-        if isinstance(data, list) and len(data) > 0:
-            results = []
-            for f in data:
-                if isinstance(f, dict):
-                    name = f.get("server_filename") or f.get("filename") or f.get("name") or f.get("file_name") or "video.mp4"
-                    dlink = f.get("dlink") or f.get("download_link") or f.get("url") or f.get("direct_link") or f.get("downloadUrl")
-                    size = int(f.get("size") or f.get("file_size") or 0)
-                    thumb = f.get("thumb") or f.get("thumbnail") or (f.get("thumbs") or {}).get("url3")
-                    if dlink:
-                        results.append(TeraboxFile(name, dlink, size, thumb, str(f.get("fs_id", ""))))
-            if results:
-                return results
+        headers = {"User-Agent": USER_AGENT, "Accept": "application/json"}
 
-        if not isinstance(data, dict):
-            return None
-
-        # Case 1: Nested files array { "list": [...] } or { "data": [...] }
-        file_list = data.get("list") or data.get("files") or data.get("data") or data.get("result")
-        if isinstance(file_list, list) and len(file_list) > 0:
-            results = []
-            for f in file_list:
-                if isinstance(f, dict):
-                    name = f.get("server_filename") or f.get("filename") or f.get("name") or f.get("file_name") or "video.mp4"
-                    dlink = f.get("dlink") or f.get("download_link") or f.get("url") or f.get("direct_link") or f.get("downloadUrl")
-                    size = int(f.get("size") or f.get("file_size") or 0)
-                    thumb = f.get("thumb") or f.get("thumbnail") or (f.get("thumbs") or {}).get("url3")
-                    if dlink:
-                        results.append(TeraboxFile(name, dlink, size, thumb, str(f.get("fs_id", ""))))
-            if results:
-                return results
-
-        # Case 2: Single object format { "file_name": "...", "download_url": "...", "size": ... }
-        name = data.get("server_filename") or data.get("filename") or data.get("name") or data.get("file_name") or data.get("title")
-        dlink = data.get("dlink") or data.get("download_link") or data.get("url") or data.get("direct_link") or data.get("downloadUrl") or data.get("download")
-        size = int(data.get("size") or data.get("file_size") or 0)
-        thumb = data.get("thumb") or data.get("thumbnail")
-
-        if dlink and isinstance(dlink, str) and dlink.startswith("http"):
-            return [TeraboxFile(name or "video.mp4", dlink, size, thumb)]
-
+        for ep in endpoints:
+            try:
+                if "/api/get-info" in ep:
+                    async with session.post(ep, json={"url": clean_url}, headers=headers, timeout=aiohttp.ClientTimeout(total=10)) as resp:
+                        if resp.status == 200:
+                            data = await resp.json()
+                            if data:
+                                dlink = data.get("download_link") or data.get("dlink") or data.get("url")
+                                if dlink:
+                                    name = data.get("file_name") or data.get("filename") or "video.mp4"
+                                    size = int(data.get("size") or data.get("size_bytes") or 0)
+                                    return [TeraboxFile(name, dlink, size, data.get("thumbnail"))]
+                else:
+                    async with session.get(ep, headers=headers, timeout=aiohttp.ClientTimeout(total=10)) as resp:
+                        if resp.status == 200:
+                            data = await resp.json()
+                            if data:
+                                dlink = data.get("download_link") or data.get("dlink") or data.get("url")
+                                if dlink:
+                                    name = data.get("file_name") or data.get("filename") or "video.mp4"
+                                    size = int(data.get("size") or data.get("size_bytes") or 0)
+                                    return [TeraboxFile(name, dlink, size, data.get("thumbnail"))]
+            except Exception:
+                continue
         return None
 
     @classmethod
     async def get_download_info(cls, url: str) -> List[TeraboxFile]:
         """Resolves the Terabox link and returns extracted TeraboxFile objects."""
-        clean_url = url.strip()
-        async with aiohttp.ClientSession() as session:
-            # 1. Resolve redirect to final canonical URL
-            final_url = await cls.resolve_url_redirect(session, clean_url)
-            
-            # Extract surl from both final_url and original clean_url
-            surl = cls.extract_surl(final_url) or cls.extract_surl(clean_url)
-
-            # 2. Try Web APIs with surl
-            if surl:
-                files = await cls.extract_via_official_api(session, surl)
-                if files:
-                    return files
-
-            # 3. Try fast API extractors with clean_url
-            files = await cls.extract_via_fast_proxies(session, clean_url)
+        # 1. Try extraction with TERABOX_COOKIE if configured
+        if TERABOX_COOKIE:
+            files = await asyncio.to_thread(cls.extract_with_cookie, url, TERABOX_COOKIE)
             if files:
                 return files
 
-            # 4. Try fast API extractors with final_url
-            if final_url != clean_url:
-                files = await cls.extract_via_fast_proxies(session, final_url)
-                if files:
-                    return files
+        # 2. Try Public Mirror APIs
+        async with aiohttp.ClientSession() as session:
+            files = await cls.extract_via_public_apis(session, url)
+            if files:
+                return files
 
-            # 5. If surl is present, construct canonical sharing link and try
-            if surl:
-                canonical_link = f"https://www.terabox.app/sharing/link?surl={surl.lstrip('1')}"
-                files = await cls.extract_via_fast_proxies(session, canonical_link)
-                if files:
-                    return files
+        # 3. If cookie wasn't provided, explain how to set TERABOX_COOKIE
+        if not TERABOX_COOKIE:
+            raise ValueError(
+                "Terabox ke anti-bot protection ko bypass karne ke liye **TERABOX_COOKIE (ndus)** zaroori hai.\n\n"
+                "📌 **Cookie Kaise Set Karein:**\n"
+                "1. Browser me [terabox.app](https://www.terabox.app) par login karein.\n"
+                "2. `F12` (Inspect) -> `Application` -> `Cookies` -> `ndus` ki value copy karein.\n"
+                "3. Heroku me `TERABOX_COOKIE` config var me paste kar dein."
+            )
 
-        raise ValueError("Could not extract direct download link from this Terabox URL. Link may be expired, password-protected, or invalid.")
+        raise ValueError("Could not extract download link. The link may be expired, private, or invalid.")
