@@ -1,4 +1,5 @@
 import re
+import json
 import logging
 import asyncio
 import aiohttp
@@ -22,6 +23,29 @@ class TeraboxFile:
     def __repr__(self):
         return f"<TeraboxFile name='{self.file_name}' size={self.size}>"
 
+def format_cookie_header(raw_cookie: str) -> str:
+    """Formats any cookie input (raw string, json from Cookie-Editor, or single ndus) into a standard Cookie header."""
+    if not raw_cookie:
+        return ""
+    raw = raw_cookie.strip()
+    # If it's JSON from Cookie-Editor export: [{"name": "...", "value": "..."}, ...]
+    if raw.startswith("[") or raw.startswith("{"):
+        try:
+            data = json.loads(raw)
+            if isinstance(data, list):
+                cookies = [f"{c['name']}={c['value']}" for c in data if isinstance(c, dict) and "name" in c and "value" in c]
+                return "; ".join(cookies)
+            elif isinstance(data, dict):
+                cookies = [f"{k}={v}" for k, v in data.items()]
+                return "; ".join(cookies)
+        except Exception:
+            pass
+
+    if "ndus=" not in raw and "=" not in raw:
+        return f"ndus={raw}; lang=en"
+    
+    return raw
+
 class TeraboxExtractor:
     """Multi-Engine Terabox Link Resolver & Direct Download Link Extractor."""
 
@@ -38,23 +62,24 @@ class TeraboxExtractor:
 
     @classmethod
     def extract_with_cookie(cls, url: str, cookie: str) -> Optional[List[TeraboxFile]]:
-        """Extracts direct download link using Terabox session cookie (ndus)."""
+        """Extracts direct download link using Terabox session cookie."""
         if not cookie:
             return None
         
-        cookie_val = cookie if "ndus=" in cookie else f"ndus={cookie}"
+        cookie_header = format_cookie_header(cookie)
         headers = {
             "Accept": "application/json, text/plain, */*",
             "Accept-Language": "en-US,en;q=0.9",
             "Connection": "keep-alive",
-            "Host": "www.terabox.app",
             "User-Agent": USER_AGENT,
-            "Cookie": cookie_val,
+            "Cookie": cookie_header,
         }
 
         try:
-            # First request to get canonical URL
-            temp_req = requests.get(url, headers=headers, timeout=20, allow_redirects=True)
+            s = requests.Session()
+            s.headers.update(headers)
+
+            temp_req = s.get(url, timeout=20, allow_redirects=True)
             if not temp_req.ok:
                 return None
 
@@ -72,9 +97,8 @@ class TeraboxExtractor:
             if not surl:
                 return None
 
-            # Second request to scrape jsToken, dp-logid, bdstoken
-            req2 = requests.get(temp_req.url, headers=headers, timeout=20)
-            respo = req2.text
+            clean_surl = surl.lstrip("1")
+            respo = temp_req.text
 
             js_token = cls._find_between(respo, 'fn%28%22', '%22%29')
             if not js_token:
@@ -82,32 +106,32 @@ class TeraboxExtractor:
                 if m_js:
                     js_token = m_js.group(1)
 
-            logid = cls._find_between(respo, 'dp-logid=', '&') or "9097091044853808108"
-            
-            clean_surl = surl.lstrip("1")
+            domain = parsed_url.netloc or "www.1024tera.com"
+            s.headers.update({"Referer": temp_req.url, "Host": domain})
+
             params = {
                 "app_id": "250528",
                 "web": "1",
                 "channel": "dubox",
                 "clienttype": "0",
                 "jsToken": js_token,
-                "dp-logid": logid,
                 "page": "1",
                 "num": "20",
                 "by": "name",
                 "order": "asc",
                 "site_referer": temp_req.url,
                 "shorturl": clean_surl,
-                "root": "1,",
+                "root": "1",
             }
 
-            list_resp = requests.get("https://www.terabox.app/share/list", headers=headers, params=params, timeout=20)
+            list_resp = s.get(f"https://{domain}/share/list", params=params, timeout=20)
             data = list_resp.json()
 
             if data and data.get("errno") == 0 and "list" in data and len(data["list"]) > 0:
                 files = []
                 for item in data["list"]:
                     dlink = item.get("dlink")
+                    # If dlink is directly available
                     if dlink:
                         thumb = item.get("thumbs", {}).get("url3") or item.get("thumbs", {}).get("url2") or item.get("thumbs", {}).get("url1")
                         files.append(TeraboxFile(
@@ -119,6 +143,30 @@ class TeraboxExtractor:
                         ))
                 if files:
                     return files
+                
+                # If dlink is not in list, request from /share/download
+                share_id = data.get("share_id")
+                uk = data.get("uk")
+                first_item = data["list"][0]
+                fs_id = first_item.get("fs_id")
+
+                dl_resp = s.post(f"https://{domain}/share/download", params={
+                    "app_id": "250528", "web": "1", "channel": "dubox", "clienttype": "0", "jsToken": js_token
+                }, data={
+                    "product": "share", "nozip": "0", "primaryid": str(share_id), "uk": str(uk),
+                    "fid_list": f"[{fs_id}]", "extra": "{}", "surl": clean_surl
+                })
+                dl_data = dl_resp.json()
+                if dl_data.get("errno") == 0 and dl_data.get("dlink"):
+                    thumb = first_item.get("thumbs", {}).get("url3") or first_item.get("thumbs", {}).get("url2")
+                    return [TeraboxFile(
+                        file_name=first_item.get("server_filename", "video.mp4"),
+                        download_url=dl_data["dlink"],
+                        size=int(first_item.get("size", 0)),
+                        thumb_url=thumb,
+                        fs_id=str(fs_id)
+                    )]
+
         except Exception as e:
             logger.debug(f"Cookie extraction failed: {e}")
             return None
@@ -169,26 +217,14 @@ class TeraboxExtractor:
     @classmethod
     async def get_download_info(cls, url: str) -> List[TeraboxFile]:
         """Resolves the Terabox link and returns extracted TeraboxFile objects."""
-        # 1. Try extraction with TERABOX_COOKIE if configured
         if TERABOX_COOKIE:
             files = await asyncio.to_thread(cls.extract_with_cookie, url, TERABOX_COOKIE)
             if files:
                 return files
 
-        # 2. Try Public Mirror APIs
         async with aiohttp.ClientSession() as session:
             files = await cls.extract_via_public_apis(session, url)
             if files:
                 return files
-
-        # 3. If cookie wasn't provided, explain how to set TERABOX_COOKIE
-        if not TERABOX_COOKIE:
-            raise ValueError(
-                "Terabox ke anti-bot protection ko bypass karne ke liye **TERABOX_COOKIE (ndus)** zaroori hai.\n\n"
-                "📌 **Cookie Kaise Set Karein:**\n"
-                "1. Browser me [terabox.app](https://www.terabox.app) par login karein.\n"
-                "2. `F12` (Inspect) -> `Application` -> `Cookies` -> `ndus` ki value copy karein.\n"
-                "3. Heroku me `TERABOX_COOKIE` config var me paste kar dein."
-            )
 
         raise ValueError("Could not extract download link. The link may be expired, private, or invalid.")
