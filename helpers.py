@@ -1,28 +1,34 @@
 import os
 import re
-import time
 import shutil
 import psutil
 
-# Regex pattern for all known Terabox domains and shortlinks
-TERABOX_REGEX = re.compile(
-    r"https?://(?:www\.)?(?:terabox\.com|teraboxapp\.com|1024tera\.com|terabox\.app|terasharelink\.com|nephobox\.com|4funbox\.com|mirrobox\.com|momerybox\.com|tibabox\.com|freeterabox\.com)/(?:s/|sharing/link\?surl=)?([a-zA-Z0-9_\-]+)",
-    re.IGNORECASE
-)
+# Recognized domains / keywords for Terabox links
+TERABOX_DOMAINS = [
+    "terabox", "1024tera", "nephobox", "4funbox", "mirrobox", 
+    "momerybox", "tibabox", "freeterabox", "terashare", "terafileshare",
+    "teraboxlink", "teraboxshare", "1024terabox"
+]
 
 def extract_terabox_url(text: str) -> str | None:
-    """Extracts the first matching Terabox URL from user text."""
+    """
+    Extracts the full complete Terabox URL from user text without truncating query parameters.
+    """
     if not text:
         return None
-    match = TERABOX_REGEX.search(text.strip())
-    if match:
-        return match.group(0)
-    # Check if text contains a raw link or surl code
-    url_match = re.search(r"https?://[^\s]+", text)
-    if url_match:
-        url = url_match.group(0)
-        if any(d in url for d in ["terabox", "1024tera", "nephobox", "4funbox", "mirrobox", "momerybox", "tibabox", "freeterabox", "terashare"]):
-            return url
+    
+    # Find any full URL in the text
+    matches = re.findall(r"https?://[^\s<>\"']+", text.strip())
+    for url in matches:
+        url_lower = url.lower()
+        if any(domain in url_lower for domain in TERABOX_DOMAINS):
+            return url.strip()
+            
+    # Check if a raw surl or shortlink was sent without http
+    surl_match = re.search(r"\b(1[a-zA-Z0-9_-]{15,35}|[a-zA-Z0-9_-]{20,35})\b", text.strip())
+    if surl_match:
+        return f"https://www.terabox.app/sharing/link?surl={surl_match.group(1)}"
+
     return None
 
 def human_readable_size(size_bytes: int) -> str:
@@ -61,7 +67,6 @@ def clean_filename(filename: str) -> str:
     """Removes unsupported characters from filenames."""
     if not filename:
         return "terabox_video.mp4"
-    # Remove characters not allowed in file names
     clean = re.sub(r'[\\/*?:"<>|]', "", filename)
     clean = clean.strip().replace(" ", "_")
     if not clean:
