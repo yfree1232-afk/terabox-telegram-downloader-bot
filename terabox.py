@@ -48,22 +48,38 @@ class TeraboxFile:
         return f"<TeraboxFile name='{self.file_name}' size={self.size} segments={len(self.segment_urls)}>"
 
 class TeraboxExtractor:
-    """High-Speed Terabox Link Resolver & Stream Extraction Engine."""
+    """Multi-Domain Terabox Link Resolver & High-Speed Stream Extraction Engine."""
 
     @staticmethod
     def extract_surl(url: str) -> Optional[str]:
+        """Extracts the unique sharing code (surl) from ANY Terabox domain/link format."""
         if not url:
             return None
-        parsed = urllib.parse.urlparse(url)
+        
+        url_clean = url.strip()
+        parsed = urllib.parse.urlparse(url_clean)
         qs = urllib.parse.parse_qs(parsed.query)
-        if "surl" in qs and qs["surl"]:
-            return qs["surl"][0].lstrip("1")
-        m = re.search(r"/s/([a-zA-Z0-9_\-]+)", url)
+        
+        # 1. Query parameters: surl or shorturl or key
+        for key in ["surl", "shorturl", "key"]:
+            if key in qs and qs[key]:
+                return qs[key][0].lstrip("1")
+
+        # 2. Path formats: /s/1... or /s/...
+        m = re.search(r"/s/([a-zA-Z0-9_\-]+)", url_clean)
         if m:
             return m.group(1).lstrip("1")
-        m2 = re.search(r"surl=([a-zA-Z0-9_\-]+)", url)
+            
+        # 3. Path with surl=
+        m2 = re.search(r"surl=([a-zA-Z0-9_\-]+)", url_clean)
         if m2:
             return m2.group(1).lstrip("1")
+
+        # 4. Raw alphanumeric share code
+        m3 = re.search(r"\b(1[a-zA-Z0-9_-]{15,35}|[a-zA-Z0-9_-]{20,35})\b", url_clean)
+        if m3:
+            return m3.group(1).lstrip("1")
+
         return None
 
     @classmethod
@@ -72,21 +88,38 @@ class TeraboxExtractor:
         if not surl:
             return None
 
-        # 1. Fetch file list from 1024tera.com
-        list_headers = {
-            "User-Agent": USER_AGENT,
-            "Referer": f"https://www.1024tera.com/sharing/link?surl={surl}",
-            "Accept": "application/json, text/plain, */*"
-        }
-        list_url = f"https://www.1024tera.com/share/list?app_id=250528&shorturl={surl}&root=1"
-        try:
-            r_list = requests.get(list_url, headers=list_headers, timeout=15)
-            list_data = r_list.json()
-        except Exception as e:
-            logger.debug(f"List request failed: {e}")
-            return None
+        # 1. Multi-domain fallback to fetch file list
+        mirror_domains = [
+            "www.1024tera.com",
+            "www.terabox.app",
+            "www.1024terabox.com",
+            "freeterabox.com",
+            "nephobox.com",
+            "4funbox.com",
+            "mirrobox.com",
+            "momerybox.com",
+            "tibabox.com",
+            "terafileshare.com"
+        ]
 
-        if list_data.get("errno") != 0 or not list_data.get("list"):
+        list_data = None
+        for domain in mirror_domains:
+            list_headers = {
+                "User-Agent": USER_AGENT,
+                "Referer": f"https://{domain}/sharing/link?surl={surl}",
+                "Accept": "application/json, text/plain, */*"
+            }
+            list_url = f"https://{domain}/share/list?app_id=250528&shorturl={surl}&root=1"
+            try:
+                r_list = requests.get(list_url, headers=list_headers, timeout=8)
+                resp_json = r_list.json()
+                if resp_json.get("errno") == 0 and resp_json.get("list"):
+                    list_data = resp_json
+                    break
+            except Exception:
+                continue
+
+        if not list_data or not list_data.get("list"):
             return None
 
         share_id = list_data.get("share_id")
@@ -100,46 +133,64 @@ class TeraboxExtractor:
             "Referer": "https://dm.1024terabox.com/"
         }
 
-        try:
-            r_home = requests.get("https://dm.1024terabox.com/api/home/info", headers=auth_headers, timeout=15)
-            home_json = r_home.json()
-            if home_json.get("errno") != 0 or "data" not in home_json:
-                return None
-            home_data = home_json["data"]
-            signb = sign_download(home_data["sign3"], home_data["sign1"])
-            ts = home_data["timestamp"]
-        except Exception as e:
-            logger.debug(f"Home info auth failed: {e}")
+        signb = None
+        ts = None
+
+        auth_endpoints = [
+            "https://dm.1024terabox.com/api/home/info",
+            "https://www.1024tera.com/api/home/info",
+            "https://www.terabox.app/api/home/info"
+        ]
+
+        for auth_url in auth_endpoints:
+            try:
+                r_home = requests.get(auth_url, headers=auth_headers, timeout=10)
+                home_json = r_home.json()
+                if home_json.get("errno") == 0 and "data" in home_json:
+                    home_data = home_json["data"]
+                    signb = sign_download(home_data["sign3"], home_data["sign1"])
+                    ts = home_data["timestamp"]
+                    break
+            except Exception:
+                continue
+
+        if not signb or not ts:
             return None
 
-        # 3. For each file in the share list, extract video stream segments
+        # 3. For each file, extract video stream segments across all resolutions
         results = []
         qualities = ["M3U8_AUTO_1080", "M3U8_AUTO_720", "M3U8_AUTO_480", "M3U8_AUTO_360", "M3U8_AUTO_240"]
+        streaming_hosts = ["dm.1024terabox.com", "www.1024tera.com", "www.terabox.app", "freeterabox.com"]
 
         for item in list_data["list"]:
             fs_id = item.get("fs_id")
             filename = item.get("server_filename", "video.mp4")
             size = int(item.get("size", 0))
             duration = int(item.get("duration", 0))
-            thumb = (item.get("thumbs") or {}).get("url3") or (item.get("thumbs") or {}).get("url2")
+            thumb = (item.get("thumbs") or {}).get("url3") or (item.get("thumbs") or {}).get("url2") or (item.get("thumbs") or {}).get("url1")
 
-            # Try streaming endpoints for this file
             segment_urls = []
-            for q in qualities:
-                st_url = f"https://dm.1024terabox.com/share/streaming?app_id=250528&web=1&channel=dubox&clienttype=0&type={q}&uk={uk}&shareid={share_id}&fid={fs_id}&surl={surl}&timestamp={ts}&sign={urllib.parse.quote(signb)}"
-                try:
-                    r_st = requests.get(st_url, headers=auth_headers, timeout=10)
-                    if "#EXTM3U" in r_st.text:
-                        segment_urls = [line.strip() for line in r_st.text.split("\n") if line.strip().startswith("http")]
-                        if segment_urls:
-                            break
-                except Exception:
-                    continue
+            final_st_url = ""
+
+            for host in streaming_hosts:
+                for q in qualities:
+                    st_url = f"https://{host}/share/streaming?app_id=250528&web=1&channel=dubox&clienttype=0&type={q}&uk={uk}&shareid={share_id}&fid={fs_id}&surl={surl}&timestamp={ts}&sign={urllib.parse.quote(signb)}"
+                    try:
+                        r_st = requests.get(st_url, headers=auth_headers, timeout=8)
+                        if "#EXTM3U" in r_st.text:
+                            segment_urls = [line.strip() for line in r_st.text.split("\n") if line.strip().startswith("http")]
+                            if segment_urls:
+                                final_st_url = st_url
+                                break
+                    except Exception:
+                        continue
+                if segment_urls:
+                    break
 
             if segment_urls:
                 results.append(TeraboxFile(
                     file_name=filename,
-                    download_url=st_url,
+                    download_url=final_st_url,
                     size=size,
                     thumb_url=thumb,
                     fs_id=str(fs_id),
@@ -159,4 +210,4 @@ class TeraboxExtractor:
         if files:
             return files
 
-        raise ValueError("Could not extract video stream. Link may be invalid, expired, or unsupported.")
+        raise ValueError("Could not extract video stream from this link. Link may be expired, private, or invalid.")
