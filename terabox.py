@@ -52,7 +52,7 @@ class TeraboxExtractor:
 
     @staticmethod
     def extract_surl(url: str) -> Optional[str]:
-        """Extracts the unique sharing code (surl) from ANY Terabox domain/link format."""
+        """Extracts the unique sharing code (surl) accurately without multi-char stripping bugs."""
         if not url:
             return None
         
@@ -63,32 +63,41 @@ class TeraboxExtractor:
         # 1. Query parameters: surl or shorturl or key
         for key in ["surl", "shorturl", "key"]:
             if key in qs and qs[key]:
-                return qs[key][0].lstrip("1")
+                return qs[key][0]
 
         # 2. Path formats: /s/1... or /s/...
         m = re.search(r"/s/([a-zA-Z0-9_\-]+)", url_clean)
         if m:
-            return m.group(1).lstrip("1")
+            code = m.group(1)
+            # Only strip the single leading prefix '1' if path starts with /s/1
+            return code[1:] if code.startswith("1") else code
             
         # 3. Path with surl=
         m2 = re.search(r"surl=([a-zA-Z0-9_\-]+)", url_clean)
         if m2:
-            return m2.group(1).lstrip("1")
+            return m2.group(1)
 
         # 4. Raw alphanumeric share code
         m3 = re.search(r"\b(1[a-zA-Z0-9_-]{15,35}|[a-zA-Z0-9_-]{20,35})\b", url_clean)
         if m3:
-            return m3.group(1).lstrip("1")
+            code = m3.group(1)
+            return code[1:] if code.startswith("1") else code
 
         return None
 
     @classmethod
     def get_stream_download_info(cls, url: str, cookie: str) -> Optional[List[TeraboxFile]]:
-        surl = cls.extract_surl(url)
-        if not surl:
+        extracted_code = cls.extract_surl(url)
+        if not extracted_code:
             return None
 
-        # 1. Multi-domain fallback to fetch file list
+        # Build candidate surl list (original code and single-1 stripped code)
+        surl_candidates = [extracted_code]
+        if extracted_code.startswith("1"):
+            surl_candidates.append(extracted_code[1:])
+        else:
+            surl_candidates.append("1" + extracted_code)
+
         mirror_domains = [
             "www.1024tera.com",
             "www.terabox.app",
@@ -103,21 +112,28 @@ class TeraboxExtractor:
         ]
 
         list_data = None
-        for domain in mirror_domains:
-            list_headers = {
-                "User-Agent": USER_AGENT,
-                "Referer": f"https://{domain}/sharing/link?surl={surl}",
-                "Accept": "application/json, text/plain, */*"
-            }
-            list_url = f"https://{domain}/share/list?app_id=250528&shorturl={surl}&root=1"
-            try:
-                r_list = requests.get(list_url, headers=list_headers, timeout=8)
-                resp_json = r_list.json()
-                if resp_json.get("errno") == 0 and resp_json.get("list"):
-                    list_data = resp_json
-                    break
-            except Exception:
-                continue
+        matched_surl = None
+
+        # 1. Multi-domain and candidate search
+        for s_code in surl_candidates:
+            for domain in mirror_domains:
+                list_headers = {
+                    "User-Agent": USER_AGENT,
+                    "Referer": f"https://{domain}/sharing/link?surl={s_code}",
+                    "Accept": "application/json, text/plain, */*"
+                }
+                list_url = f"https://{domain}/share/list?app_id=250528&shorturl={s_code}&root=1"
+                try:
+                    r_list = requests.get(list_url, headers=list_headers, timeout=8)
+                    resp_json = r_list.json()
+                    if resp_json.get("errno") == 0 and resp_json.get("list"):
+                        list_data = resp_json
+                        matched_surl = s_code
+                        break
+                except Exception:
+                    continue
+            if list_data:
+                break
 
         if not list_data or not list_data.get("list"):
             return None
@@ -174,7 +190,7 @@ class TeraboxExtractor:
 
             for host in streaming_hosts:
                 for q in qualities:
-                    st_url = f"https://{host}/share/streaming?app_id=250528&web=1&channel=dubox&clienttype=0&type={q}&uk={uk}&shareid={share_id}&fid={fs_id}&surl={surl}&timestamp={ts}&sign={urllib.parse.quote(signb)}"
+                    st_url = f"https://{host}/share/streaming?app_id=250528&web=1&channel=dubox&clienttype=0&type={q}&uk={uk}&shareid={share_id}&fid={fs_id}&surl={matched_surl}&timestamp={ts}&sign={urllib.parse.quote(signb)}"
                     try:
                         r_st = requests.get(st_url, headers=auth_headers, timeout=8)
                         if "#EXTM3U" in r_st.text:
