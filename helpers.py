@@ -2,32 +2,49 @@ import os
 import re
 import shutil
 import psutil
+import requests
 
-# Recognized domains / keywords for Terabox links
+# All recognized domains, subdomains & alias keywords for Terabox
 TERABOX_DOMAINS = [
     "terabox", "1024tera", "nephobox", "4funbox", "mirrobox", 
     "momerybox", "tibabox", "freeterabox", "terashare", "terafileshare",
-    "teraboxlink", "teraboxshare", "1024terabox"
+    "teraboxlink", "teraboxshare", "1024terabox", "terasharefile",
+    "teraboxapp", "terafiles", "teraboxdrive", "teraboxurl", "teraboxcdn",
+    "teradownloader", "dubox", "tera-box", "terabox.fun", "terashare.link",
+    "terashare.com", "terabox.link", "terabox.online"
 ]
 
 def extract_terabox_url(text: str) -> str | None:
     """
-    Extracts the full complete Terabox URL from user text without truncating query parameters.
+    Extracts any Terabox link from user text across all known domains, 
+    mirror links, shortlinks, or raw surl share codes.
     """
     if not text:
         return None
     
-    # Find any full URL in the text
-    matches = re.findall(r"https?://[^\s<>\"']+", text.strip())
+    clean_text = text.strip()
+    
+    # 1. Check for any full URL containing Terabox domains
+    matches = re.findall(r"https?://[^\s<>\"']+", clean_text)
     for url in matches:
         url_lower = url.lower()
         if any(domain in url_lower for domain in TERABOX_DOMAINS):
             return url.strip()
             
-    # Check if a raw surl or shortlink was sent without http
-    surl_match = re.search(r"\b(1[a-zA-Z0-9_-]{15,35}|[a-zA-Z0-9_-]{20,35})\b", text.strip())
+    # 2. Check if a shortlink/redirect was sent
+    for url in matches:
+        try:
+            resp = requests.head(url, allow_redirects=True, timeout=5, headers={"User-Agent": "Mozilla/5.0"})
+            final_url = resp.url.lower()
+            if any(domain in final_url for domain in TERABOX_DOMAINS) or "surl=" in final_url or "/s/" in final_url:
+                return resp.url
+        except Exception:
+            pass
+
+    # 3. Check if a raw surl / share code was sent directly (e.g. 1JbdsCwLyjufpcwEmbyIg6Q)
+    surl_match = re.search(r"\b(1[a-zA-Z0-9_-]{15,35}|[a-zA-Z0-9_-]{20,35})\b", clean_text)
     if surl_match:
-        return f"https://www.terabox.app/sharing/link?surl={surl_match.group(1)}"
+        return f"https://www.1024tera.com/sharing/link?surl={surl_match.group(1)}"
 
     return None
 
